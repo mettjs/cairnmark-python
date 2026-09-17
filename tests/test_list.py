@@ -12,13 +12,22 @@ def test_list_sends_filter_params(file_json):
     route = respx.get(f"{BASE}/files").respond(200, json={"files": [], "limit": 10, "count": 0})
     cm = CairnMark(BASE)
 
-    page = cm.list(content_type="text/plain", tags={"env": "demo"}, limit=10, cursor="cur1")
+    page = cm.list(
+        content_type="text/plain", tags={"env": "demo"}, limit=10, cursor="cur1", entries="only"
+    )
     assert page.files == [] and page.next_cursor is None
     params = route.calls.last.request.url.params
     assert params["content_type"] == "text/plain"
     assert params["tag.env"] == "demo"
+    assert params["entries"] == "only"
     assert params["limit"] == "10"
     assert params["cursor"] == "cur1"
+
+
+def test_list_rejects_bad_entries_scope():
+    cm = CairnMark(BASE)
+    with pytest.raises(ValueError):
+        cm.list(entries="archives")
 
 
 def paged_handler(file_json, n):

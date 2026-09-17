@@ -104,3 +104,43 @@ async def test_async_not_found():
     async with AsyncCairnMark(BASE, retries=0) as cm:
         with pytest.raises(NotFoundError):
             await cm.get_metadata("nope")
+
+
+@respx.mock
+async def test_async_archive_entries_and_extract():
+    listing = {
+        "archive_id": "zip1",
+        "entries": [
+            {"index": 0, "name": "a.pdf", "size": 3, "crc32": "00000000", "selectable": True}
+        ],
+    }
+    summary = {
+        "archive_id": "zip1",
+        "entries": 1,
+        "extracted": 1,
+        "skipped": 0,
+        "skipped_by_reason": {},
+        "sample_skipped": [],
+    }
+    job = {
+        "id": "j1",
+        "archive_id": "zip1",
+        "status": "succeeded",
+        "progress": {"done": 1, "total": 1},
+        "cancel_requested": False,
+        "summary": summary,
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-01T00:00:01Z",
+        "finished_at": "2026-01-01T00:00:01Z",
+    }
+    respx.get(f"{BASE}/files/zip1/archive").respond(200, json=listing)
+    submit = respx.post(f"{BASE}/files/zip1/extract").respond(
+        202, json={**job, "status": "pending"}
+    )
+    respx.get(f"{BASE}/jobs/j1").respond(200, json=job)
+    async with AsyncCairnMark(BASE, poll_interval=0.001) as cm:
+        entries = await cm.archive_entries("zip1")
+        assert entries[0].index == 0 and entries[0].selectable
+        result = await cm.extract("zip1", entries=[0])
+    assert result.extracted == 1
+    assert submit.calls.last.request.content == b'{"entries":[0]}'

@@ -10,27 +10,40 @@ import asyncio
 import contextlib
 import json
 import os
-from typing import Any, AsyncIterator, Callable, Iterator, cast
+from typing import Any, AsyncIterator, Callable, Iterable, Iterator, cast
 from urllib.parse import quote
 
 import httpx
 
 from ._http import (
+    DEFAULT_POLL_INTERVAL,
     DEFAULT_RETRIES,
     DEFAULT_TIMEOUT,
     averify_bytes,
     backoff_delay,
+    deadline_from,
     error_from_response,
+    extract_request,
+    job_error,
     list_params,
+    next_poll_delay,
     range_header,
+    remaining,
     resolve_idempotency_key,
     retry_delay,
     rewinder,
     unexpected_status,
     upload_params_headers,
 )
-from .errors import CairnMarkError, ServerError
-from .models import File, ListPage
+from .errors import (
+    APIError,
+    CairnMarkError,
+    IdempotencyConflictError,
+    InvalidParameterError,
+    ServerError,
+    WaitTimeoutError,
+)
+from .models import ArchiveEntry, ExtractSummary, File, Job, ListPage
 from .version import __version__
 
 
@@ -80,8 +93,10 @@ class AsyncCairnMark:
         retries: int = DEFAULT_RETRIES,
         user_agent: str | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
+        poll_interval: float = DEFAULT_POLL_INTERVAL,
     ) -> None:
         self._retries = retries
+        self._poll_interval = poll_interval
         merged = dict(headers or {})
         merged["User-Agent"] = user_agent or f"cairnmark-python/{__version__}"
         self._http = httpx.AsyncClient(
@@ -128,7 +143,7 @@ class AsyncCairnMark:
                 return resp
             err = error_from_response(resp)
             if isinstance(err, ServerError) and attempt < self._retries:
-                await asyncio.sleep(backoff_delay(attempt))
+                await asyncio.sleep(retry_delay(err, attempt))
                 attempt += 1
                 continue
             raise err
@@ -212,7 +227,7 @@ class AsyncCairnMark:
         """Open the file's content; see CairnMark.download for the semantics."""
         ranged = offset is not None or length is not None
         if verify and ranged:
-            raise ValueError("verify is incompatible with a range download")
+            raise InvalidParameterError("verify is incompatible with a range download")
 
         file = await self.get_metadata(file_id)
         if verify and not file.checksum_sha256:
@@ -277,7 +292,7 @@ class AsyncCairnMark:
     ) -> File:
         """Merge (default) or replace (``mode="replace"``) the file's tags."""
         if mode not in ("merge", "replace"):
-            raise ValueError(f'mode must be "merge" or "replace", not {mode!r}')
+            raise InvalidParameterError(f'mode must be "merge" or "replace", not {mode!r}')
         params = {"mode": "replace"} if mode == "replace" else None
         resp = await self._request(
             "PATCH",
@@ -301,11 +316,11 @@ class AsyncCairnMark:
         tags: dict[str, str] | None = None,
         limit: int | None = None,
         cursor: str | None = None,
+        entries: str | None = None,
     ) -> ListPage:
         """One page of files matching the filter, newest first."""
-        resp = await self._request(
-            "GET", "/files", params=list_params(content_type, tags, limit, cursor)
-        )
+        params = list_params(content_type, tags, limit, cursor, entries)
+        resp = await self._request("GET", "/files", params=params)
         return ListPage.from_json(resp.json())
 
     async def iter_files(
@@ -314,16 +329,98 @@ class AsyncCairnMark:
         content_type: str | None = None,
         tags: dict[str, str] | None = None,
         limit: int | None = None,
+        entries: str | None = None,
     ) -> AsyncIterator[File]:
         """Every file matching the filter, fetching pages lazily."""
         cursor: str | None = None
         while True:
-            page = await self.list(content_type=content_type, tags=tags, limit=limit, cursor=cursor)
+            page = await self.list(
+                content_type=content_type, tags=tags, limit=limit, cursor=cursor, entries=entries
+            )
             for file in page.files:
                 yield file
             if not page.next_cursor:
                 return
             cursor = page.next_cursor
+
+    # -- archives ----------------------------------------------------------------
+
+    async def archive_entries(self, file_id: str) -> list[ArchiveEntry]:
+        """List the zip's entries; see CairnMark.archive_entries."""
+        resp = await self._request("GET", _file_path(file_id) + "/archive")
+        return [ArchiveEntry.from_json(e) for e in resp.json().get("entries") or []]
+
+    async def extract(
+        self,
+        file_id: str,
+        *,
+        entries: Iterable[int] | None = None,
+        timeout: float | None = None,
+    ) -> ExtractSummary:
+        """Store the zip's entries as files and wait; see CairnMark.extract."""
+        deadline = deadline_from(timeout)
+        job = await self._submit_waiting_out_conflicts(file_id, entries, deadline)
+        job = await self._wait(job.id, deadline)
+        if job.status != "succeeded":
+            raise job_error(job)
+        if job.summary is None:
+            raise CairnMarkError(f"extraction job {job.id} succeeded without a summary")
+        return job.summary
+
+    async def extract_async(self, file_id: str, *, entries: Iterable[int] | None = None) -> Job:
+        """Submit an extraction and return the pending job; see
+        CairnMark.extract_async."""
+        headers, content = extract_request(entries)
+        resp = await self._request(
+            "POST", _file_path(file_id) + "/extract", headers=headers, content=content, expect=202
+        )
+        return Job.from_json(resp.json())
+
+    async def job(self, job_id: str) -> Job:
+        """The job's current state; see CairnMark.job."""
+        resp = await self._request("GET", _job_path(job_id))
+        return Job.from_json(resp.json())
+
+    async def cancel_job(self, job_id: str) -> Job:
+        """Ask the job to stop; see CairnMark.cancel_job."""
+        resp = await self._request("POST", _job_path(job_id) + "/cancel", expect=202)
+        return Job.from_json(resp.json())
+
+    async def wait_for_job(self, job_id: str, *, timeout: float | None = None) -> Job:
+        """Poll until the job is terminal; see CairnMark.wait_for_job."""
+        return await self._wait(job_id, deadline_from(timeout))
+
+    async def _wait(self, job_id: str, deadline: float | None) -> Job:
+        delay = self._poll_interval
+        while True:
+            job = await self.job(job_id)
+            if job.terminal:
+                return job
+            left = remaining(deadline)
+            if left is not None:
+                if left <= 0:
+                    raise WaitTimeoutError(job)
+                delay = min(delay, left)
+            await asyncio.sleep(delay)
+            delay = next_poll_delay(delay, self._poll_interval)
+
+    async def _submit_waiting_out_conflicts(
+        self, file_id: str, entries: Iterable[int] | None, deadline: float | None
+    ) -> Job:
+        selection = None if entries is None else list(entries)  # an iterator is one-shot
+        attempt = 0
+        while True:
+            try:
+                return await self.extract_async(file_id, entries=selection)
+            except IdempotencyConflictError as err:
+                if attempt >= self._retries:
+                    raise
+                attempt += 1
+                if err.job_id:
+                    with contextlib.suppress(APIError):
+                        await self._wait(err.job_id, deadline)
+                else:
+                    await asyncio.sleep(retry_delay(err, attempt - 1))
 
     # -- probes / lifecycle ------------------------------------------------------
 
@@ -347,6 +444,10 @@ class AsyncCairnMark:
 
 def _file_path(file_id: str) -> str:
     return "/files/" + quote(file_id, safe="")
+
+
+def _job_path(job_id: str) -> str:
+    return "/jobs/" + quote(job_id, safe="")
 
 
 def _as_async_content(content: Any) -> Any:

@@ -6,18 +6,24 @@ import contextlib
 import json
 import os
 import time
-from typing import Any, Iterator
+from typing import Any, Iterable, Iterator
 from urllib.parse import quote
 
 import httpx
 
 from ._http import (
+    DEFAULT_POLL_INTERVAL,
     DEFAULT_RETRIES,
     DEFAULT_TIMEOUT,
     backoff_delay,
+    deadline_from,
     error_from_response,
+    extract_request,
+    job_error,
     list_params,
+    next_poll_delay,
     range_header,
+    remaining,
     resolve_idempotency_key,
     retry_delay,
     rewinder,
@@ -25,8 +31,15 @@ from ._http import (
     upload_params_headers,
     verify_bytes,
 )
-from .errors import CairnMarkError, ServerError
-from .models import File, ListPage
+from .errors import (
+    APIError,
+    CairnMarkError,
+    IdempotencyConflictError,
+    InvalidParameterError,
+    ServerError,
+    WaitTimeoutError,
+)
+from .models import ArchiveEntry, ExtractSummary, File, Job, ListPage
 from .version import __version__
 
 
@@ -68,6 +81,8 @@ class CairnMark:
     The server has no auth — put it behind your gateway and inject
     credentials via ``headers``. ``timeout`` is httpx's per-operation timeout
     (connect / single read), so it does not cut off large streams.
+    ``poll_interval`` is the first wait between polls of an extraction job;
+    each wait doubles up to a 10s ceiling.
     """
 
     def __init__(
@@ -79,8 +94,10 @@ class CairnMark:
         retries: int = DEFAULT_RETRIES,
         user_agent: str | None = None,
         transport: httpx.BaseTransport | None = None,
+        poll_interval: float = DEFAULT_POLL_INTERVAL,
     ) -> None:
         self._retries = retries
+        self._poll_interval = poll_interval
         merged = dict(headers or {})
         merged["User-Agent"] = user_agent or f"cairnmark-python/{__version__}"
         self._http = httpx.Client(
@@ -104,7 +121,7 @@ class CairnMark:
         follow_redirects: bool = False,
         expect: int = 200,
     ) -> httpx.Response:
-        """One small (non-streaming) call, retried on network errors and 5xx."""
+        """One non-streaming call, retried on network errors and 5xx."""
         attempt = 0
         while True:
             try:
@@ -128,7 +145,7 @@ class CairnMark:
                 return resp
             err = error_from_response(resp)
             if isinstance(err, ServerError) and attempt < self._retries:
-                time.sleep(backoff_delay(attempt))
+                time.sleep(retry_delay(err, attempt))
                 attempt += 1
                 continue
             raise err
@@ -223,7 +240,7 @@ class CairnMark:
         """
         ranged = offset is not None or length is not None
         if verify and ranged:
-            raise ValueError("verify is incompatible with a range download")
+            raise InvalidParameterError("verify is incompatible with a range download")
 
         # The metadata record supplies the stored checksum for verification
         # and rounds out the result either way.
@@ -297,7 +314,7 @@ class CairnMark:
     def update_metadata(self, file_id: str, tags: dict[str, Any], *, mode: str = "merge") -> File:
         """Merge (default) or replace (``mode="replace"``) the file's tags."""
         if mode not in ("merge", "replace"):
-            raise ValueError(f'mode must be "merge" or "replace", not {mode!r}')
+            raise InvalidParameterError(f'mode must be "merge" or "replace", not {mode!r}')
         params = {"mode": "replace"} if mode == "replace" else None
         resp = self._request(
             "PATCH",
@@ -321,9 +338,17 @@ class CairnMark:
         tags: dict[str, str] | None = None,
         limit: int | None = None,
         cursor: str | None = None,
+        entries: str | None = None,
     ) -> ListPage:
-        """One page of files matching the filter, newest first."""
-        resp = self._request("GET", "/files", params=list_params(content_type, tags, limit, cursor))
+        """One page of files matching the filter, newest first.
+
+        ``entries`` scopes files extracted from archives: ``"include"`` (the
+        default) lists them with everything else, ``"exclude"`` hides them,
+        ``"only"`` lists them alone. The archives themselves are found with
+        ``tags={TAG_ARCHIVE: "true"}``.
+        """
+        params = list_params(content_type, tags, limit, cursor, entries)
+        resp = self._request("GET", "/files", params=params)
         return ListPage.from_json(resp.json())
 
     def iter_files(
@@ -332,17 +357,146 @@ class CairnMark:
         content_type: str | None = None,
         tags: dict[str, str] | None = None,
         limit: int | None = None,
+        entries: str | None = None,
     ) -> Iterator[File]:
         """Every file matching the filter, fetching pages lazily."""
         cursor: str | None = None
         while True:
-            page = self.list(content_type=content_type, tags=tags, limit=limit, cursor=cursor)
+            page = self.list(
+                content_type=content_type, tags=tags, limit=limit, cursor=cursor, entries=entries
+            )
             yield from page.files
             # A page without a cursor is the last (a final empty page is
             # normal when the total is an exact multiple of the page size).
             if not page.next_cursor:
                 return
             cursor = page.next_cursor
+
+    # -- archives ----------------------------------------------------------------
+
+    def archive_entries(self, file_id: str) -> list[ArchiveEntry]:
+        """List the entries of the zip stored as ``file_id``, each marked
+        selectable or carrying the reason the server would skip it. Nothing is
+        written. Raises NotArchiveError if the file is not a zip, TooLargeError
+        if it has more entries than the server's cap, or a central directory
+        larger than the server will parse."""
+        resp = self._request("GET", _file_path(file_id) + "/archive")
+        return [ArchiveEntry.from_json(e) for e in resp.json().get("entries") or []]
+
+    def extract(
+        self,
+        file_id: str,
+        *,
+        entries: Iterable[int] | None = None,
+        timeout: float | None = None,
+    ) -> ExtractSummary:
+        """Store the zip's entries as ordinary files — each tagged with
+        TAG_ARCHIVE_ID, TAG_ARCHIVE_PATH and TAG_ARCHIVE_INDEX — and return
+        the summary once the extraction has finished.
+
+        The server runs an extraction as a job; this is ``extract_async``
+        followed by ``wait_for_job``, kept as one call because most callers
+        want exactly that. ``entries`` restricts the run to those directory
+        indexes (from ``archive_entries``); None extracts every selectable
+        entry, an empty list extracts nothing. ``timeout`` bounds the whole
+        wait in seconds (None, the default, waits as long as it takes) and
+        raises WaitTimeoutError without cancelling the job. Another
+        extraction of the same archive in flight is waited out and this one
+        then resubmitted, since extraction resumes past entries already
+        stored and the other job's selection may not be ours; a re-run after
+        success is a no-op that reports every entry as already_extracted. A
+        job that fails raises ExtractionFailedError; one that is cancelled
+        raises ExtractionCancelledError with the partial summary.
+        """
+        deadline = deadline_from(timeout)
+        job = self._submit_waiting_out_conflicts(file_id, entries, deadline)
+        job = self._wait(job.id, deadline)
+        if job.status != "succeeded":
+            raise job_error(job)
+        if job.summary is None:
+            raise CairnMarkError(f"extraction job {job.id} succeeded without a summary")
+        return job.summary
+
+    def extract_async(self, file_id: str, *, entries: Iterable[int] | None = None) -> Job:
+        """Submit an extraction and return the pending job without waiting.
+
+        Everything that can be refused up front is refused now, with the
+        errors a synchronous run gave — NotArchiveError, TooLargeError,
+        InvalidRequestError for a selection out of range — so a job only
+        fails on what could not be known at submission. Another job for the
+        same archive still pending or running raises
+        IdempotencyConflictError, whose ``job_id`` names it: poll that one,
+        or wait for it and resubmit, which is what ``extract`` does.
+        """
+        headers, content = extract_request(entries)
+        resp = self._request(
+            "POST", _file_path(file_id) + "/extract", headers=headers, content=content, expect=202
+        )
+        return Job.from_json(resp.json())
+
+    def job(self, job_id: str) -> Job:
+        """The job's current state. NotFoundError once the server has purged
+        it — CAIRNMARK_JOB_RETENTION after it finished — so a poller slower
+        than that loses the result; the extracted files are permanent."""
+        resp = self._request("GET", _job_path(job_id))
+        return Job.from_json(resp.json())
+
+    def cancel_job(self, job_id: str) -> Job:
+        """Ask the job to stop and return its state after the request.
+
+        A pending job is cancelled at once; a running one stops after the
+        entry it is writing and keeps the entries stored so far, so a later
+        ``extract`` resumes past them; a finished job comes back unchanged.
+        Idempotent.
+        """
+        resp = self._request("POST", _job_path(job_id) + "/cancel", expect=202)
+        return Job.from_json(resp.json())
+
+    def wait_for_job(self, job_id: str, *, timeout: float | None = None) -> Job:
+        """Poll until the job is terminal and return it whatever the outcome
+        — inspect ``status``, or let ``extract`` turn a failure or a
+        cancellation into an error. Polls every ``poll_interval`` seconds,
+        doubling to a 10s ceiling; ``timeout`` bounds the wait and raises
+        WaitTimeoutError, which does not cancel the job."""
+        return self._wait(job_id, deadline_from(timeout))
+
+    def _wait(self, job_id: str, deadline: float | None) -> Job:
+        delay = self._poll_interval
+        while True:
+            job = self.job(job_id)
+            if job.terminal:
+                return job
+            left = remaining(deadline)
+            if left is not None:
+                if left <= 0:
+                    raise WaitTimeoutError(job)
+                delay = min(delay, left)
+            time.sleep(delay)
+            delay = next_poll_delay(delay, self._poll_interval)
+
+    def _submit_waiting_out_conflicts(
+        self, file_id: str, entries: Iterable[int] | None, deadline: float | None
+    ) -> Job:
+        """extract_async that, on a 409, waits for the job holding the archive
+        to end — whatever its outcome — and resubmits, up to ``retries``
+        times. Waiting on that job beats sleeping out Retry-After: it is
+        exactly as long as needed and never longer."""
+        selection = None if entries is None else list(entries)  # an iterator is one-shot
+        attempt = 0
+        while True:
+            try:
+                return self.extract_async(file_id, entries=selection)
+            except IdempotencyConflictError as err:
+                if attempt >= self._retries:
+                    raise
+                attempt += 1
+                if err.job_id:
+                    # A 404 (purged already) or any other failure to observe
+                    # it means the archive is, or is about to be, free.
+                    with contextlib.suppress(APIError):
+                        self._wait(err.job_id, deadline)
+                else:
+                    time.sleep(retry_delay(err, attempt - 1))
 
     # -- probes / lifecycle ------------------------------------------------------
 
@@ -366,3 +520,7 @@ class CairnMark:
 
 def _file_path(file_id: str) -> str:
     return "/files/" + quote(file_id, safe="")
+
+
+def _job_path(job_id: str) -> str:
+    return "/jobs/" + quote(job_id, safe="")

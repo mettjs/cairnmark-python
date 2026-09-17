@@ -5,9 +5,12 @@ import respx
 from cairnmark import (
     APIError,
     CairnMark,
+    CairnMarkError,
     IdempotencyConflictError,
     IdempotencyGoneError,
+    InvalidParameterError,
     InvalidRequestError,
+    NotArchiveError,
     NotFoundError,
     RangeNotSatisfiableError,
     ServerError,
@@ -22,6 +25,7 @@ CASES = [
     (409, IdempotencyConflictError),
     (410, IdempotencyGoneError),
     (413, TooLargeError),
+    (415, NotArchiveError),
     (416, RangeNotSatisfiableError),
     (500, ServerError),
 ]
@@ -42,6 +46,22 @@ def test_error_mapping(status, exc_type):
     assert err.message == "boom"
     if status == 409:
         assert err.retry_after == 7.0
+
+
+@respx.mock
+def test_conflict_carries_the_active_job_id():
+    respx.post(f"{BASE}/files/zip1/extract").respond(
+        409, json={"error": "in progress", "job_id": "j9"}, headers={"Retry-After": "30"}
+    )
+    cm = CairnMark(BASE, retries=0)
+    with pytest.raises(IdempotencyConflictError) as exc:
+        cm.extract_async("zip1")
+    assert exc.value.job_id == "j9" and exc.value.retry_after == 30.0
+    # An upload conflict carries none.
+    respx.post(f"{BASE}/files").respond(409, json={"error": "in flight"})
+    with pytest.raises(IdempotencyConflictError) as exc:
+        cm.upload(b"x", idempotency_key="k")
+    assert exc.value.job_id is None
 
 
 @respx.mock
@@ -74,3 +94,19 @@ def test_default_headers_sent(file_json):
     req = route.calls.last.request
     assert req.headers["Authorization"] == "Bearer tok"
     assert req.headers["User-Agent"].startswith("cairnmark-python/")
+
+
+def test_bad_arguments_raise_both_bases():
+    """Argument validation is a CairnMarkError, as errors.py documents, and
+    still a ValueError, which is what a caller passing a bad argument catches.
+    """
+    cm = CairnMark(BASE)
+    for call in (
+        lambda: cm.list(entries="onlyy"),
+        lambda: cm.update_metadata("abc", {"a": "b"}, mode="clobber"),
+        lambda: cm.download("abc", verify=True, offset=0, length=10),
+    ):
+        with pytest.raises(InvalidParameterError) as exc:
+            call()
+        assert isinstance(exc.value, CairnMarkError)
+        assert isinstance(exc.value, ValueError)

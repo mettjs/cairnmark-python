@@ -6,12 +6,14 @@
 Honors CAIRNMARK_BASE_URL (default http://localhost:8080).
 """
 
+import io
 import os
 import time
+import zipfile
 
 import pytest
 
-from cairnmark import AsyncCairnMark, CairnMark, NotFoundError
+from cairnmark import TAG_ARCHIVE_ID, TAG_ARCHIVE_PATH, AsyncCairnMark, CairnMark, NotFoundError
 
 pytestmark = pytest.mark.integration
 
@@ -78,3 +80,103 @@ async def test_async_round_trip():
         await cm.delete(f.id)
         with pytest.raises(NotFoundError):
             await cm.get_metadata(f.id)
+
+
+DOC = b"%PDF-1.7 integration quarterly report"
+
+
+def _zip_fixture() -> bytes:
+    """Two documents plus the resource-fork twin Finder would add."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("reports/q3.pdf", DOC)
+        zf.writestr("reports/data.json", b'{"ok":true}')
+        zf.writestr("__MACOSX/reports/._q3.pdf", b"junk")
+    return buf.getvalue()
+
+
+def test_sync_archive():
+    with CairnMark(BASE_URL) as cm:
+        cm.ready()
+        arch = cm.upload(
+            _zip_fixture(),
+            filename="docs.zip",
+            content_type="application/zip",
+            idempotency_key="auto",
+        )
+        try:
+            # List: the junk is flagged, the document is selectable with its type.
+            entries = cm.archive_entries(arch.id)
+            q3 = next(e for e in entries if e.name == "reports/q3.pdf")
+            assert q3.selectable and q3.content_type == "application/pdf" and q3.size == len(DOC)
+            junk = next(e for e in entries if e.name.startswith("__MACOSX/"))
+            assert not junk.selectable and junk.reason == "platform_metadata"
+
+            # Extract just that entry.
+            summary = cm.extract(arch.id, entries=[q3.index])
+            assert summary.extracted == 1
+            assert summary.skipped_by_reason["not_selected"] == 1
+            assert summary.skipped_by_reason["platform_metadata"] == 1
+
+            # Find it by its tags and download it verified.
+            children = list(
+                cm.iter_files(tags={TAG_ARCHIVE_ID: arch.id, TAG_ARCHIVE_PATH: "reports/q3.pdf"})
+            )
+            assert len(children) == 1
+            child = children[0]
+            try:
+                assert child.filename == "q3.pdf"
+                with cm.download(child.id, verify=True) as dl:
+                    assert dl.read() == DOC
+
+                # The scoped listing sees it; a re-run is a no-op.
+                assert cm.list(tags={TAG_ARCHIVE_ID: arch.id}, entries="only").count == 1
+                again = cm.extract(arch.id, entries=[q3.index])
+                assert again.extracted == 0
+                assert again.skipped_by_reason["already_extracted"] == 1
+
+                # The job surface underneath: submit without waiting, read it,
+                # wait for it, and cancel a finished job as a no-op.
+                job = cm.extract_async(arch.id)
+                assert job.archive_id == arch.id and not job.terminal
+                assert cm.job(job.id).id == job.id
+                done = cm.wait_for_job(job.id)
+                assert done.status == "succeeded" and done.summary is not None
+                assert done.summary.extracted == 1  # data.json, the entry not selected before
+                assert cm.cancel_job(job.id).status == "succeeded"
+                # Cancel straight after submitting: usually still pending and
+                # cancelled outright, but a fast pickup may finish it first —
+                # both are correct terminal states.
+                job = cm.extract_async(arch.id)
+                cm.cancel_job(job.id)
+                assert cm.wait_for_job(job.id).status in ("cancelled", "succeeded")
+                for extra in cm.iter_files(tags={TAG_ARCHIVE_ID: arch.id}):
+                    if extra.id != child.id:
+                        cm.delete(extra.id)
+            finally:
+                cm.delete(child.id)
+        finally:
+            cm.delete(arch.id)
+
+
+async def test_async_archive():
+    async with AsyncCairnMark(BASE_URL) as cm:
+        arch = await cm.upload(_zip_fixture(), filename="docs.zip", idempotency_key="auto")
+        try:
+            entries = await cm.archive_entries(arch.id)
+            q3 = next(e for e in entries if e.name == "reports/q3.pdf")
+            summary = await cm.extract(arch.id, entries=[q3.index])
+            assert summary.extracted == 1
+            children = [
+                c async for c in cm.iter_files(tags={TAG_ARCHIVE_ID: arch.id}, entries="only")
+            ]
+            assert [c.filename for c in children] == ["q3.pdf"]
+
+            job = await cm.extract_async(arch.id, entries=[q3.index])
+            done = await cm.wait_for_job(job.id)
+            assert done.status == "succeeded" and done.summary is not None
+            assert done.summary.skipped_by_reason["already_extracted"] == 1
+            assert (await cm.cancel_job(job.id)).status == "succeeded"
+            await cm.delete(children[0].id)
+        finally:
+            await cm.delete(arch.id)

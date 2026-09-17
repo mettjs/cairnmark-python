@@ -9,17 +9,31 @@ from __future__ import annotations
 import hashlib
 import json
 import random
+import time
 import uuid
-from typing import Any, AsyncIterator, Callable, Iterator
+from typing import Any, AsyncIterator, Callable, Iterable, Iterator
 
 import httpx
 
-from .errors import APIError, ChecksumMismatchError, error_class_for
+from .errors import (
+    APIError,
+    ChecksumMismatchError,
+    ExtractionCancelledError,
+    ExtractionFailedError,
+    InvalidParameterError,
+    JobError,
+    error_class_for,
+)
+from .models import Job
 
 DEFAULT_RETRIES = 2
 DEFAULT_TIMEOUT = 30.0
 #: Cap on how long a retry waits on a server-supplied Retry-After.
 MAX_RETRY_AFTER = 30.0
+#: The first wait between polls of an extraction job, and the ceiling the
+#: doubling stops at.
+DEFAULT_POLL_INTERVAL = 1.0
+MAX_POLL_INTERVAL = 10.0
 
 
 def backoff_delay(attempt: int) -> float:
@@ -38,10 +52,12 @@ def retry_delay(err: APIError | None, attempt: int) -> float:
 def error_from_response(response: httpx.Response) -> APIError:
     """Map a non-2xx response (body already read) to a typed APIError."""
     message = ""
+    job_id = None
     try:
         body = response.json()
         if isinstance(body, dict):
             message = str(body.get("error") or "")
+            job_id = body.get("job_id") or None
     except ValueError:
         pass
     if not message:
@@ -50,7 +66,7 @@ def error_from_response(response: httpx.Response) -> APIError:
     ra = response.headers.get("retry-after", "")
     if ra.isdigit() and int(ra) > 0:
         retry_after = float(ra)
-    return error_class_for(response.status_code)(response.status_code, message, retry_after)
+    return error_class_for(response.status_code)(response.status_code, message, retry_after, job_id)
 
 
 def unexpected_status(response: httpx.Response, want: int) -> APIError:
@@ -91,23 +107,70 @@ def upload_params_headers(
     return params, headers
 
 
+#: Values of the ``entries`` list filter: whether files extracted from archives
+#: appear together with everything else, are hidden, or are listed alone.
+ENTRY_SCOPES = ("include", "exclude", "only")
+
+
 def list_params(
     content_type: str | None,
     tags: dict[str, str] | None,
     limit: int | None,
     cursor: str | None,
+    entries: str | None = None,
 ) -> dict[str, str]:
     """Query params for GET /files."""
+    if entries is not None and entries not in ENTRY_SCOPES:
+        raise InvalidParameterError(
+            f'entries must be "include", "exclude" or "only", not {entries!r}'
+        )
     params: dict[str, str] = {}
     if content_type:
         params["content_type"] = content_type
     for key, value in (tags or {}).items():
         params[f"tag.{key}"] = value
+    if entries:
+        params["entries"] = entries
     if limit:
         params["limit"] = str(limit)
     if cursor:
         params["cursor"] = cursor
     return params
+
+
+def extract_request(entries: Iterable[int] | None) -> tuple[dict[str, str] | None, bytes | None]:
+    """Headers and body for POST /files/{id}/extract.
+
+    No body means every selectable entry; a body with an (even empty) list
+    selects by directory index.
+    """
+    if entries is None:
+        return None, None
+    body = json.dumps({"entries": list(entries)}, separators=(",", ":")).encode()
+    return {"Content-Type": "application/json"}, body
+
+
+def next_poll_delay(delay: float, initial: float) -> float:
+    """The wait after ``delay``: doubled, up to the ceiling (or ``initial``
+    if that is larger, so a caller asking for slow polls gets them)."""
+    return min(delay * 2, max(MAX_POLL_INTERVAL, initial))
+
+
+def deadline_from(timeout: float | None) -> float | None:
+    """A monotonic deadline for ``timeout`` seconds from now; None for none."""
+    return None if timeout is None else time.monotonic() + timeout
+
+
+def remaining(deadline: float | None) -> float | None:
+    """Seconds left until ``deadline``; None when there is no deadline."""
+    return None if deadline is None else deadline - time.monotonic()
+
+
+def job_error(job: Job) -> JobError:
+    """The error for a terminal job that did not succeed."""
+    if job.status == "cancelled":
+        return ExtractionCancelledError(job)
+    return ExtractionFailedError(job)
 
 
 def range_header(offset: int, length: int | None) -> str:
